@@ -1,0 +1,129 @@
+name: PostgreSQL Database Manager Node 2 - 5H Auto-Restart
+
+on:
+  schedule:
+    # Run every 5 hours offset by 30 minutes (00:30, 05:30, 10:30, 15:30, 20:30 UTC)
+    - cron: '30 */5 * * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual dispatch'
+        required: false
+        default: 'Manual operator restart'
+  repository_dispatch:
+    types: [restart_node2, sync_database]
+
+concurrency:
+  group: postgres-manager-node2
+  cancel-in-progress: false
+
+jobs:
+  postgres-node2:
+    name: PostgreSQL Manager Node 2
+    runs-on: ubuntu-latest
+    timeout-minutes: 320
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: square_era
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout sesydb2 Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Manager Dependencies
+        run: |
+          npm ci || npm install
+
+      - name: Clone Data Repository (sedb)
+        run: |
+          git clone https://github.com/yasamarium/sedb.git sedb-data
+
+      - name: Verify PostgreSQL Connection
+        run: |
+          sudo apt-get install -y postgresql-client
+          until pg_isready -h localhost -p 5432 -U postgres; do
+            echo "Waiting for PostgreSQL service container..."
+            sleep 2
+          done
+          echo "PostgreSQL service is fully operational."
+
+      - name: Initialize Database Schema and Seed Data
+        env:
+          PGPASSWORD: postgrespassword
+        run: |
+          psql -h localhost -p 5432 -U postgres -d square_era -f sedb-data/schema/init.sql
+          psql -h localhost -p 5432 -U postgres -d square_era -f sedb-data/schema/seed.sql
+          echo "PostgreSQL schema and baseline seeds initialized."
+
+      - name: Initial Data Synchronization
+        env:
+          DATABASE_URL: postgresql://postgres:postgrespassword@localhost:5432/square_era
+        run: |
+          cd sedb-data && npm install && node scripts/sync_data.js
+
+      - name: Launch Cloudflare Tunnel
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+          cloudflared tunnel --url http://localhost:8080 > tunnel.log 2>&1 &
+          sleep 6
+          echo "Cloudflare Tunnel Status:"
+          grep -o 'https://.*\.trycloudflare\.com' tunnel.log | head -n 1 || echo "Tunnel initializing..."
+
+      - name: Launch PostgreSQL Manager Daemon and 5-Hour Runner Loop
+        env:
+          DATABASE_URL: postgresql://postgres:postgrespassword@localhost:5432/square_era
+          PORT: 8080
+          GH_PAT: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          node manager.js &
+          MANAGER_PID=$!
+          echo "PostgreSQL Manager Node 2 daemon started with PID $MANAGER_PID"
+          sleep 3
+
+          # Health check verification
+          curl -s http://localhost:8080/health | jq . || curl -s http://localhost:8080/health
+
+          echo "Starting 5-hour continuous run cycle (285 minutes active)..."
+          TARGET_MINUTES=285
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $TARGET_MINUTES ]; do
+            sleep 300
+            ELAPSED=$((ELAPSED + 5))
+            echo "[$(date -u +%T)] Node 2 active: ${ELAPSED}/${TARGET_MINUTES} minutes completed."
+            curl -s http://localhost:8080/health | jq '{status, uptimeSeconds, pool}' || true
+          done
+
+          echo "5-hour run target reached. Initiating clean handoff..."
+
+      - name: Auto-Restart Workflow Trigger (5-Hour Cycle)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Triggering 5-hour auto-restart for PostgreSQL Manager Node 2..."
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/yasamarium/sesydb2/actions/workflows/postgres-runner.yml/dispatches \
+            -d '{"ref":"main"}' || echo "Workflow dispatch dispatched."
+          echo "Auto-restart trigger completed."
